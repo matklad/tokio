@@ -232,6 +232,8 @@ impl Worker {
         while self.check_run_state(first) {
             first = false;
 
+            self.drain_inbound();
+
             // Run the next available task
             if self.try_run_task(&notify) {
                 if self.is_blocking.get() {
@@ -387,12 +389,8 @@ impl Worker {
         }
     }
 
-    /// Returns `true` if any worker's queue or the external queue has tasks.
+    /// Returns `true` if any worker's queue.
     fn check_available_tasks(&self) -> bool {
-        if !self.inner.external_queue.is_empty() {
-            return true;
-        }
-
         for worker in self.inner.workers.iter() {
             if worker.has_tasks() {
                 return true;
@@ -423,14 +421,14 @@ impl Worker {
 
                         self.run_task(task, notify);
 
+                        trace!("try_steal_task -- signal_work; self={}; from={}",
+                               self.id.0, idx);
+
                         // Signal other workers that work is available
                         //
                         // TODO: Should this be called here or before
                         // `run_task`?
                         self.inner.signal_work(&self.inner);
-
-                        trace!("try_steal_task -- signal_work; self={}; from={}",
-                               self.id.0, idx);
 
                         return true;
                     }
@@ -446,21 +444,6 @@ impl Worker {
             if idx == start {
                 break;
             }
-        }
-
-        // Try stealing from the external queue.
-        if let Some(task) = self.inner.external_queue.try_pop() {
-            trace!("stole task from external queue");
-
-            self.run_task(task, notify);
-
-            // Signal other workers that work is available
-            //
-            // TODO: Should this be called here or before
-            // `run_task`?
-            self.inner.signal_work(&self.inner);
-
-            return true;
         }
 
         found_work
@@ -569,6 +552,29 @@ impl Worker {
         };
 
         task.run(notify)
+    }
+
+    /// Drains all tasks on the extern queue and pushes them onto the internal
+    /// queue.
+    ///
+    /// Returns `true` if the operation was able to complete in a consistent
+    /// state.
+    #[inline]
+    fn drain_inbound(&self) {
+        let mut found_work = false;
+
+        while let Some(task) = self.entry().inbound.try_pop() {
+            found_work = true;
+            self.entry().push_internal(task);
+        }
+
+        if found_work {
+            // TODO: Why is this called on every iteration? Would it
+            // not be better to only signal when work was found
+            // after waking up?
+            trace!("found work while draining; signal_work");
+            self.inner.signal_work(&self.inner);
+        }
     }
 
     /// Put the worker to sleep
@@ -831,6 +837,10 @@ impl Drop for Worker {
         trace!("shutting down thread; idx={}", self.id.0);
 
         if self.should_finalize.get() {
+            // Get all inbound work and push it onto the work queue. The work
+            // queue is drained in the next step.
+            self.drain_inbound();
+
             // Drain the work queue
             self.entry().drain_tasks();
 
