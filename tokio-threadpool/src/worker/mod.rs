@@ -423,14 +423,14 @@ impl Worker {
 
                         self.run_task(task, notify);
 
-                        trace!("try_steal_task -- signal_work; self={}; from={}",
-                               self.id.0, idx);
-
                         // Signal other workers that work is available
                         //
                         // TODO: Should this be called here or before
                         // `run_task`?
                         self.inner.signal_work(&self.inner);
+
+                        trace!("try_steal_task -- signal_work; self={}; from={}",
+                               self.id.0, idx);
 
                         return true;
                     }
