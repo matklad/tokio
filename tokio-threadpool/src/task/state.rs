@@ -15,6 +15,9 @@ pub(crate) enum State {
 
     /// Task is complete
     Complete = 4,
+
+    /// Task was aborted because the thread pool has been shut down
+    Aborted = 5,
 }
 
 // ===== impl State =====

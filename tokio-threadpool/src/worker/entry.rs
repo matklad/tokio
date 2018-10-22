@@ -2,9 +2,11 @@ use park::{BoxPark, BoxUnpark};
 use task::{Task, Queue};
 use worker::state::{State, PUSHED_MASK};
 
+use std::collections::HashSet;
 use std::cell::UnsafeCell;
 use std::fmt;
-use std::sync::Arc;
+use std::mem;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::atomic::Ordering::{Acquire, AcqRel, Relaxed};
 
@@ -21,6 +23,9 @@ pub(crate) struct WorkerEntry {
     // The `usize` value is deserialized to a `worker::State` instance. See
     // comments on that type.
     pub state: CachePadded<AtomicUsize>,
+
+    // The set of tasks registered in this worker entry.
+    owned_tasks: Mutex<HashSet<*const Task>>,
 
     // Next entry in the parked Trieber stack
     next_sleeper: UnsafeCell<usize>,
@@ -47,12 +52,13 @@ impl WorkerEntry {
 
         WorkerEntry {
             state: CachePadded::new(AtomicUsize::new(State::default().into())),
+            owned_tasks: Mutex::new(HashSet::new()),
             next_sleeper: UnsafeCell::new(0),
             worker: w,
             stealer: s,
-            inbound: Queue::new(),
             park: UnsafeCell::new(park),
             unpark,
+            inbound: Queue::new(),
         }
     }
 
@@ -216,6 +222,39 @@ impl WorkerEntry {
                 Pop::Empty => break,
                 Pop::Retry => {}
             }
+        }
+    }
+
+    /// Registers a task in this worker.
+    ///
+    /// This is called the first time a task is polled and assigned a home worker.
+    pub fn register_task(&self, task: Arc<Task>) {
+        let mut set = self.owned_tasks.lock().unwrap();
+        let raw = &*task as *const Task;
+        assert!(set.insert(raw));
+        mem::forget(task);
+    }
+
+    /// Unregisters a task from this worker.
+    ///
+    /// This is called when the task is completed.
+    pub fn unregister_task(&self, task: &Arc<Task>) {
+        let mut set = self.owned_tasks.lock().unwrap();
+        let raw = &**task as *const Task;
+        assert!(set.remove(&raw));
+        unsafe {
+            drop(Arc::from_raw(raw));
+        }
+    }
+
+    /// Aborts all incomplete tasks registered in this worker.
+    ///
+    /// This is called when the threadpool shuts down.
+    pub fn abort_incomplete_tasks(&self) {
+        let mut set = self.owned_tasks.lock().unwrap();
+        for raw in set.drain() {
+            let task = unsafe { Arc::from_raw(raw) };
+            task.abort();
         }
     }
 

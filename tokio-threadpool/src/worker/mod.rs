@@ -14,6 +14,7 @@ pub(crate) use self::state::{
 use pool::{self, Pool, BackupId};
 use notifier::Notifier;
 use sender::Sender;
+use shutdown::ShutdownTrigger;
 use task::{self, Task, CanBlock};
 
 use tokio_executor;
@@ -39,7 +40,7 @@ use std::time::Duration;
 #[derive(Debug)]
 pub struct Worker {
     // Shared scheduler data
-    pub(crate) inner: Arc<Pool>,
+    pub(crate) pool: Arc<Pool>,
 
     // WorkerEntry index
     pub(crate) id: WorkerId,
@@ -59,6 +60,9 @@ pub struct Worker {
 
     // Set when the worker should finalize on drop
     should_finalize: Cell<bool>,
+
+    // Completes the shutdown process when the `ThreadPool` and all `Worker`s get dropped.
+    trigger: Arc<ShutdownTrigger>,
 
     // Keep the value on the current thread.
     _p: PhantomData<Rc<()>>,
@@ -86,14 +90,15 @@ pub struct WorkerId(pub(crate) usize);
 thread_local!(static CURRENT_WORKER: Cell<*const Worker> = Cell::new(0 as *const _));
 
 impl Worker {
-    pub(crate) fn new(id: WorkerId, backup_id: BackupId, inner: Arc<Pool>) -> Worker {
+    pub(crate) fn new(id: WorkerId, backup_id: BackupId, pool: Arc<Pool>, trigger: Arc<ShutdownTrigger>) -> Worker {
         Worker {
-            inner,
+            pool,
             id,
             backup_id,
             current_task: CurrentTask::new(),
             is_blocking: Cell::new(false),
             should_finalize: Cell::new(false),
+            trigger,
             _p: PhantomData,
         }
     }
@@ -111,14 +116,14 @@ impl Worker {
         CURRENT_WORKER.with(|c| {
             c.set(self as *const _);
 
-            let inner = self.inner.clone();
-            let mut sender = Sender { inner };
+            let pool = self.pool.clone();
+            let mut sender = Sender { pool };
 
             // Enter an execution context
             let mut enter = tokio_executor::enter().unwrap();
 
             tokio_executor::with_default(&mut sender, &mut enter, |enter| {
-                if let Some(ref callback) = self.inner.config.around_worker {
+                if let Some(ref callback) = self.pool.config.around_worker {
                     callback.call(self, enter);
                 } else {
                     self.run();
@@ -165,7 +170,7 @@ impl Worker {
                 // Atomically attempt to acquire blocking capacity, and if none
                 // is available, register the task to be notified once capacity
                 // becomes available.
-                match self.inner.poll_blocking_capacity(task_ref)? {
+                match self.pool.poll_blocking_capacity(task_ref)? {
                     Async::Ready(()) => {
                         self.current_task.set_can_block(Allocated);
                     }
@@ -192,7 +197,7 @@ impl Worker {
         // Transitioning to blocking requires handing over the worker state to
         // another thread so that the work queue can continue to be processed.
 
-        self.inner.spawn_thread(self.id.clone(), &self.inner);
+        self.pool.spawn_thread(self.id.clone(), &self.pool);
 
         // Track that the thread has now fully entered the blocking state.
         self.is_blocking.set(true);
@@ -222,7 +227,7 @@ impl Worker {
 
         // Get the notifier.
         let notify = Arc::new(Notifier {
-            inner: self.inner.clone(),
+            pool: self.pool.clone(),
         });
 
         let mut first = true;
@@ -286,7 +291,7 @@ impl Worker {
         //
         // The returned result is ignored because `Err` represents the pool
         // shutting down. We are currently aware of this fact.
-        let _ = self.inner.release_backup(self.backup_id);
+        let _ = self.pool.release_backup(self.backup_id);
 
         self.should_finalize.set(true);
     }
@@ -315,7 +320,7 @@ impl Worker {
         let mut state: State = self.entry().state.load(Acquire).into();
 
         loop {
-            let pool_state: pool::State = self.inner.state.load(Acquire).into();
+            let pool_state: pool::State = self.pool.state.load(Acquire).into();
 
             if pool_state.is_terminated() {
                 return false;
@@ -373,7 +378,7 @@ impl Worker {
             trace!("Worker::check_run_state; delegate signal");
             // This worker is not ready to be signaled, so delegate the signal
             // to another worker.
-            self.inner.signal_work(&self.inner);
+            self.pool.signal_work(&self.pool);
         }
 
         true
@@ -404,14 +409,14 @@ impl Worker {
 
         debug_assert!(!self.is_blocking.get());
 
-        let len = self.inner.workers.len();
-        let mut idx = self.inner.rand_usize() % len;
+        let len = self.pool.workers.len();
+        let mut idx = self.pool.rand_usize() % len;
         let mut found_work = false;
         let start = idx;
 
         loop {
             if idx < len {
-                match self.inner.workers[idx].steal_tasks(self.entry()) {
+                match self.pool.workers[idx].steal_tasks(self.entry()) {
                     Steal::Data(task) => {
                         trace!("stole task");
 
@@ -424,7 +429,7 @@ impl Worker {
                         //
                         // TODO: Should this be called here or before
                         // `run_task`?
-                        self.inner.signal_work(&self.inner);
+                        self.pool.signal_work(&self.pool);
 
                         return true;
                     }
@@ -448,6 +453,12 @@ impl Worker {
     fn run_task(&self, task: Arc<Task>, notify: &Arc<Notifier>) {
         use task::Run::*;
 
+        // If this is the first time this task is being polled, initialize its home worker and
+        // register it.
+        if task.init_home_worker(&self.id) {
+            self.entry().register_task(task.clone());
+        }
+
         let run = self.run_task2(&task, notify);
 
         // TODO: Try to claim back the worker state in case the backup thread
@@ -466,19 +477,19 @@ impl Worker {
                     //
                     // We have to call `submit_external` instead of `submit`
                     // here because `self` is still set as the current worker.
-                    self.inner.submit_external(task, &self.inner);
+                    self.pool.submit_external(task, &self.pool);
                 } else {
                     self.entry().push_internal(task);
                 }
             }
             Complete => {
-                let mut state: pool::State = self.inner.state.load(Acquire).into();
+                let mut state: pool::State = self.pool.state.load(Acquire).into();
 
                 loop {
                     let mut next = state;
                     next.dec_num_futures();
 
-                    let actual = self.inner.state.compare_and_swap(
+                    let actual = self.pool.state.compare_and_swap(
                         state.into(), next.into(), AcqRel).into();
 
                     if actual == state {
@@ -490,9 +501,13 @@ impl Worker {
                             // up any sleeping worker so that they can notice
                             // the shutdown state.
                             if next.is_terminated() {
-                                self.inner.terminate_sleeping_workers();
+                                self.pool.terminate_sleeping_workers();
                             }
                         }
+
+                        // Unregister the task from its home worker.
+                        let home_index = task.home_worker().unwrap().0;
+                        self.pool.workers[home_index].unregister_task(&task);
 
                         // The worker's run loop will detect the shutdown state
                         // next iteration.
@@ -528,7 +543,7 @@ impl Worker {
                 // transitioned to blocking in this call, then another task has
                 // to be notified.
                 if self.allocated_at_run && !self.worker.is_blocking.get() {
-                    self.worker.inner.notify_blocking_task(&self.worker.inner);
+                    self.worker.pool.notify_blocking_task(&self.worker.pool);
                 }
 
                 self.worker.current_task.clear();
@@ -571,7 +586,7 @@ impl Worker {
                         // not be better to only signal when work was found
                         // after waking up?
                         trace!("found work while draining; signal_work");
-                        self.inner.signal_work(&self.inner);
+                        self.pool.signal_work(&self.pool);
                     }
 
                     return true;
@@ -579,7 +594,7 @@ impl Worker {
                 Inconsistent => {
                     if found_work {
                         trace!("found work while draining; signal_work");
-                        self.inner.signal_work(&self.inner);
+                        self.pool.signal_work(&self.pool);
                     }
 
                     return false;
@@ -649,7 +664,7 @@ impl Worker {
 
                     // We obtained permission to push the worker into the
                     // sleeper queue.
-                    if let Err(_) = self.inner.push_sleeper(self.id.0) {
+                    if let Err(_) = self.pool.push_sleeper(self.id.0) {
                         trace!("  sleeping -- push to stack failed; idx={}", self.id.0);
                         // The push failed due to the pool being terminated.
                         //
@@ -726,7 +741,7 @@ impl Worker {
 
     fn entry(&self) -> &Entry {
         debug_assert!(!self.is_blocking.get());
-        &self.inner.workers[self.id.0]
+        &self.pool.workers[self.id.0]
     }
 }
 

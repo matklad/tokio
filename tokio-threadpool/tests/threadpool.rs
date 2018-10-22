@@ -11,7 +11,6 @@ use std::cell::Cell;
 use std::sync::{mpsc, Arc};
 use std::sync::atomic::*;
 use std::sync::atomic::Ordering::Relaxed;
-use std::time::Duration;
 
 thread_local!(static FOO: Cell<u32> = Cell::new(0));
 
@@ -419,4 +418,61 @@ fn multi_threadpool() {
     }));
 
     done_rx.recv().unwrap();
+}
+
+#[test]
+fn eagerly_drops_futures() {
+    use futures::future::{Future, lazy, empty};
+    use futures::task;
+    use std::sync::mpsc;
+
+    struct NotifyOnDrop(mpsc::Sender<()>);
+
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            self.0.send(()).unwrap();
+        }
+    }
+
+    let pool = ThreadPool::new();
+
+    let (task_tx, task_rx) = mpsc::channel();
+    let (drop_tx, drop_rx) = mpsc::channel();
+
+    // Get the signal that the handler dropped.
+    let notify_on_drop = NotifyOnDrop(drop_tx);
+
+    pool.spawn(lazy(move || {
+        // Get a handle to the current task
+        let task = task::current();
+
+        // Send it to the main thread to hold on to.
+        task_tx.send(task).unwrap();
+
+        // This future will never resolve, it is only used to hold on to thee
+        // `notify_on_drop` handle
+        empty::<(), ()>().then(move |_| {
+            // This code path should never be reached
+            if true { panic!() }
+
+            // Explicitly drop `notify_on_drop` here, this is mostly to ensure
+            // that the `notify_on_drop` handle gets moved into the task. It
+            // will actually get dropped when the runtime is dropped.
+            drop(notify_on_drop);
+
+            Ok(())
+        })
+    }));
+
+    // Wait until we get the task handle
+    let task = task_rx.recv().unwrap();
+
+    // Drop the pool, this should result in futures being forcefully dropped.
+    drop(pool);
+
+    // If the future is forcefully dropped, then we will get a signal here.
+    drop_rx.recv().unwrap();
+
+    // Ensure `task` lives until after the test completes
+    drop(task);
 }

@@ -10,6 +10,7 @@ use self::state::State;
 
 use notifier::Notifier;
 use pool::Pool;
+use worker::WorkerId;
 
 use futures::{self, Future, Async};
 use futures::executor::{self, Spawn};
@@ -18,7 +19,10 @@ use std::{fmt, panic, ptr};
 use std::cell::{UnsafeCell};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicPtr};
-use std::sync::atomic::Ordering::{AcqRel, Release, Relaxed};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Release, Relaxed};
+
+/// The integer representation for `None::<WorkerId>`.
+const NONE_WORKER_ID: usize = !0;
 
 /// Harness around a future.
 ///
@@ -27,6 +31,11 @@ use std::sync::atomic::Ordering::{AcqRel, Release, Relaxed};
 pub(crate) struct Task {
     /// Task lifecycle state
     state: AtomicUsize,
+
+    /// The ID of the worker entry this task is registered in.
+    ///
+    /// If this task hasn't been registered yet, the ID is set to `NONE_WORKER_ID`.
+    home_worker: AtomicUsize,
 
     /// Task blocking related state
     blocking: AtomicUsize,
@@ -62,6 +71,7 @@ impl Task {
 
         Task {
             state: AtomicUsize::new(State::new().into()),
+            home_worker: AtomicUsize::new(NONE_WORKER_ID),
             blocking: AtomicUsize::new(BlockingState::new().into()),
             next: AtomicPtr::new(ptr::null_mut()),
             next_blocking: AtomicPtr::new(ptr::null_mut()),
@@ -77,10 +87,33 @@ impl Task {
 
         Task {
             state: AtomicUsize::new(State::stub().into()),
+            home_worker: AtomicUsize::new(NONE_WORKER_ID),
             blocking: AtomicUsize::new(BlockingState::new().into()),
             next: AtomicPtr::new(ptr::null_mut()),
             next_blocking: AtomicPtr::new(ptr::null_mut()),
             future: UnsafeCell::new(Some(task_fut)),
+        }
+    }
+
+    /// Try initializing this task's home worker.
+    ///
+    /// Returns `true` on success, or `false` if the home worker was already initialized.
+    pub fn init_home_worker(&self, id: &WorkerId) -> bool {
+        if self.home_worker.load(Acquire) == NONE_WORKER_ID {
+            assert_eq!(self.home_worker.swap(id.0, Release), NONE_WORKER_ID);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns the ID of this task's home worker.
+    pub fn home_worker(&self) -> Option<WorkerId> {
+        let current = self.home_worker.load(Acquire);
+        if current == NONE_WORKER_ID {
+            None
+        } else {
+            Some(WorkerId(current))
         }
     }
 
@@ -171,6 +204,41 @@ impl Task {
         }
     }
 
+    /// Aborts this task.
+    ///
+    /// This is called when the threadpool shuts down and the task has already beed polled but not
+    /// completed.
+    pub fn abort(&self) {
+        use self::State::*;
+
+        let mut state = self.state.load(Acquire).into();
+
+        loop {
+            match state {
+                Idle | Scheduled => {}
+                Running | Notified | Complete | Aborted => {
+                    // It is assumed that no worker threads are running so the task must be either
+                    // in the idle or scheduled state.
+                    panic!("unexpected state while aborting task: {:?}", state);
+                }
+            }
+
+            let actual = self.state.compare_and_swap(
+                state.into(),
+                Aborted.into(),
+                AcqRel).into();
+
+            if actual == state {
+                // The future has been aborted. Drop it immediately to free resources and run drop
+                // handlers.
+                self.drop_future();
+                break;
+            }
+
+            state = actual;
+        }
+    }
+
     /// Notify the task
     pub fn notify(me: Arc<Task>, pool: &Arc<Pool>) {
         if me.schedule() {
@@ -211,7 +279,7 @@ impl Task {
                         _ => return false,
                     }
                 }
-                Complete | Notified | Scheduled => return false,
+                Complete | Aborted | Notified | Scheduled => return false,
             }
         }
     }
