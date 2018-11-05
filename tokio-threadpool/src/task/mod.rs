@@ -99,7 +99,7 @@ impl Task {
     ///
     /// Returns `true` on success, or `false` if the home worker was already initialized.
     pub fn init_home_worker(&self, id: &WorkerId) -> bool {
-        if self.home_worker.load(Acquire) == NONE_WORKER_ID {
+        if self.home_worker.load(Relaxed) == NONE_WORKER_ID {
             assert_eq!(self.home_worker.swap(id.0, Release), NONE_WORKER_ID);
             true
         } else {
