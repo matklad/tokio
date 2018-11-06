@@ -686,11 +686,7 @@ impl Worker {
         // calling the parker. This is done in a loop as condvars can wakeup
         // spuriously.
         loop {
-            unsafe {
-                (*self.entry().park.get())
-                    .park()
-                    .unwrap();
-            }
+            self.entry().park();
 
             trace!("    -> wakeup; idx={}", self.id.0);
 
@@ -732,11 +728,7 @@ impl Worker {
     /// `park.park_timeout` with a duration of 0. This allows the park
     /// implementation to perform any work that might be done on an interval.
     fn sleep_light(&self) {
-        unsafe {
-            (*self.entry().park.get())
-                .park_timeout(Duration::from_millis(0))
-                .unwrap();
-        }
+        self.entry().park_timeout(Duration::from_millis(0));
     }
 
     fn entry(&self) -> &Entry {

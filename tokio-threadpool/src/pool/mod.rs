@@ -457,8 +457,8 @@ impl Pool {
             // the worker if necessary.
             match worker_state.lifecycle() {
                 Sleeping => {
-                    trace!("signal_work -- wakeup; idx={}", idx);
-                    self.workers[idx].wakeup();
+                    trace!("signal_work -- unpark; idx={}", idx);
+                    self.workers[idx].unpark();
                 }
                 Shutdown => {
                     trace!("signal_work -- spawn; idx={}", idx);

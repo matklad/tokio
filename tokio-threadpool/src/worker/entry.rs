@@ -9,6 +9,7 @@ use std::mem;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::atomic::Ordering::{Acquire, AcqRel, Relaxed};
+use std::time::Duration;
 
 use crossbeam_utils::CachePadded;
 use deque;
@@ -37,10 +38,10 @@ pub(crate) struct WorkerEntry {
     stealer: deque::Stealer<Arc<Task>>,
 
     // Thread parker
-    pub park: UnsafeCell<BoxPark>,
+    park: UnsafeCell<Option<BoxPark>>,
 
     // Thread unparker
-    pub unpark: BoxUnpark,
+    unpark: BoxUnpark,
 
     // MPSC queue of jobs submitted to the worker from an external source.
     pub inbound: Queue,
@@ -56,7 +57,7 @@ impl WorkerEntry {
             next_sleeper: UnsafeCell::new(0),
             worker: w,
             stealer: s,
-            park: UnsafeCell::new(park),
+            park: UnsafeCell::new(Some(park)),
             unpark,
             inbound: Queue::new(),
         }
@@ -124,7 +125,7 @@ impl WorkerEntry {
             Sleeping => {
                 // The worker is currently sleeping, the condition variable must
                 // be signaled
-                self.wakeup();
+                self.unpark();
                 true
             }
             Shutdown => false,
@@ -186,8 +187,8 @@ impl WorkerEntry {
             state = actual;
         }
 
-        // Wakeup the worker
-        self.wakeup();
+        // Unpark the worker
+        self.unpark();
     }
 
     /// Pop a task
@@ -225,6 +226,26 @@ impl WorkerEntry {
         }
     }
 
+    /// Parks the worker thread.
+    pub fn park(&self) {
+        if let Some(park) = unsafe { (*self.park.get()).as_mut() } {
+            park.park().unwrap();
+        }
+    }
+
+    /// Parks the worker thread for at most `duration`.
+    pub fn park_timeout(&self, duration: Duration) {
+        if let Some(park) = unsafe { (*self.park.get()).as_mut() } {
+            park.park_timeout(duration).unwrap();
+        }
+    }
+
+    /// Unparks the worker thread.
+    #[inline]
+    pub fn unpark(&self) {
+        self.unpark.unpark();
+    }
+
     /// Registers a task in this worker.
     ///
     /// This is called the first time a task is polled and assigned a home worker.
@@ -247,14 +268,18 @@ impl WorkerEntry {
         }
     }
 
-    /// Aborts all incomplete tasks registered in this worker.
+    /// Drop the remaining incomplete tasks and the parker associated with this worker.
     ///
-    /// This is called when the threadpool shuts down.
-    pub fn abort_incomplete_tasks(&self) {
+    /// This is called by the shutdown trigger.
+    pub fn shutdown(&self) {
         let mut set = self.owned_tasks.lock().unwrap();
         for raw in set.drain() {
             let task = unsafe { Arc::from_raw(raw) };
             task.abort();
+        }
+
+        unsafe {
+            *self.park.get() = None;
         }
     }
 
@@ -266,11 +291,6 @@ impl WorkerEntry {
     #[inline]
     pub fn push_internal(&self, task: Arc<Task>) {
         self.worker.push(task);
-    }
-
-    #[inline]
-    pub fn wakeup(&self) {
-        self.unpark.unpark();
     }
 
     #[inline]

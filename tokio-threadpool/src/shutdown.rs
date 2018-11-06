@@ -80,9 +80,9 @@ impl ShutdownTrigger {
 
 impl Drop for ShutdownTrigger {
     fn drop(&mut self) {
-        // Drop the remaining incomplete tasks.
+        // Drop the remaining incomplete tasks and parkers assosicated with workers.
         for worker in self.workers.iter() {
-            worker.abort_incomplete_tasks();
+            worker.shutdown();
         }
 
         // Notify the task interested in shutdown.
