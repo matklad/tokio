@@ -510,7 +510,7 @@ impl Worker {
                         // `unregister_task` fast path. Otherwise, fall back to
                         // the slower `completed_task` method.
                         let home_index = task.home_worker().unwrap().0;
-                        if home_index == self.id().0 {
+                        if !self.is_blocking.get() && home_index == self.id().0 {
                             self.entry().unregister_task(task);
                         } else {
                             self.pool.workers[home_index].completed_task(task);
