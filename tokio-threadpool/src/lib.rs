@@ -83,6 +83,7 @@ extern crate crossbeam_deque as deque;
 extern crate crossbeam_utils;
 #[macro_use]
 extern crate futures;
+extern crate fnv;
 extern crate num_cpus;
 extern crate rand;
 

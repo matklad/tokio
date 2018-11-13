@@ -505,9 +505,16 @@ impl Worker {
                             }
                         }
 
-                        // Unregister the task from its home worker.
+                        // Unregister the task from its home worker. If the
+                        // task is owned by the current worker, use the
+                        // `unregister_task` fast path. Otherwise, fall back to
+                        // the slower `completed_task` method.
                         let home_index = task.home_worker().unwrap().0;
-                        self.pool.workers[home_index].unregister_task(&task);
+                        if home_index == self.id().0 {
+                            self.entry().unregister_task(task);
+                        } else {
+                            self.pool.workers[home_index].completed_task(task);
+                        }
 
                         // The worker's run loop will detect the shutdown state
                         // next iteration.

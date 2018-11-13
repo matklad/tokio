@@ -2,8 +2,7 @@ use park::{BoxPark, BoxUnpark};
 use task::{Task, Queue};
 use worker::state::{State, PUSHED_MASK};
 
-use std::collections::HashSet;
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::fmt;
 use std::mem;
 use std::sync::{Arc, Mutex};
@@ -13,6 +12,11 @@ use std::time::Duration;
 
 use crossbeam_utils::CachePadded;
 use deque;
+use fnv::FnvHashSet;
+
+// How many `register_task()` and `unregister_task()` calls need to happen between task cleanups
+// with `cleanup_completed_tasks()`.
+const TASK_CLEANUP_INTERVAL: usize = 100;
 
 // TODO: None of the fields should be public
 //
@@ -25,8 +29,14 @@ pub(crate) struct WorkerEntry {
     // comments on that type.
     pub state: CachePadded<AtomicUsize>,
 
-    // The set of tasks registered in this worker entry.
-    owned_tasks: Mutex<HashSet<*const Task>>,
+    // Ticker for triggering task cleanup with `cleanup_completed_tasks()`.
+    ticker: Cell<usize>,
+
+    // Set of tasks registered in this worker entry.
+    owned_tasks: UnsafeCell<FnvHashSet<*const Task>>,
+
+    // List of tasks that were stolen from this worker entry and then completed.
+    completed_tasks: Mutex<Vec<Arc<Task>>>,
 
     // Next entry in the parked Trieber stack
     next_sleeper: UnsafeCell<usize>,
@@ -53,7 +63,9 @@ impl WorkerEntry {
 
         WorkerEntry {
             state: CachePadded::new(AtomicUsize::new(State::default().into())),
-            owned_tasks: Mutex::new(HashSet::new()),
+            ticker: Cell::new(0),
+            owned_tasks: UnsafeCell::new(FnvHashSet::default()),
+            completed_tasks: Mutex::new(Vec::new()),
             next_sleeper: UnsafeCell::new(0),
             worker: w,
             stealer: s,
@@ -252,29 +264,50 @@ impl WorkerEntry {
     ///
     /// This is called the first time a task is polled and assigned a home worker.
     pub fn register_task(&self, task: Arc<Task>) {
-        let mut set = self.owned_tasks.lock().unwrap();
+        let set = unsafe { &mut *self.owned_tasks.get() };
         let raw = &*task as *const Task;
         assert!(set.insert(raw));
         mem::forget(task);
+
+        self.ticker.set(self.ticker.get() + 1);
+        if self.ticker.get() >= TASK_CLEANUP_INTERVAL {
+            self.ticker.set(0);
+            self.cleanup_completed_tasks();
+        }
     }
 
     /// Unregisters a task from this worker.
     ///
-    /// This is called when the task is completed.
-    pub fn unregister_task(&self, task: &Arc<Task>) {
-        let mut set = self.owned_tasks.lock().unwrap();
-        let raw = &**task as *const Task;
+    /// This is called when the task is completed by this worker.
+    pub fn unregister_task(&self, task: Arc<Task>) {
+        let set = unsafe { &mut *self.owned_tasks.get() };
+        let raw = &*task as *const Task;
         assert!(set.remove(&raw));
         unsafe {
             drop(Arc::from_raw(raw));
         }
+
+        self.ticker.set(self.ticker.get() + 1);
+        if self.ticker.get() >= TASK_CLEANUP_INTERVAL {
+            self.ticker.set(0);
+            self.cleanup_completed_tasks();
+        }
+    }
+
+    /// Informs the worker that a stolen task has been completed.
+    ///
+    /// This is called when the task is completed by another worker.
+    pub fn completed_task(&self, task: Arc<Task>) {
+        self.completed_tasks.lock().unwrap().push(task);
     }
 
     /// Drop the remaining incomplete tasks and the parker associated with this worker.
     ///
     /// This is called by the shutdown trigger.
     pub fn shutdown(&self) {
-        let mut set = self.owned_tasks.lock().unwrap();
+        self.cleanup_completed_tasks();
+
+        let set = unsafe { &mut *self.owned_tasks.get() };
         for raw in set.drain() {
             let task = unsafe { Arc::from_raw(raw) };
             task.abort();
@@ -283,6 +316,20 @@ impl WorkerEntry {
         unsafe {
             *self.park.get() = None;
             *self.unpark.get() = None;
+        }
+    }
+
+    /// Unregisters all tasks in `completed_tasks`.
+    fn cleanup_completed_tasks(&self) {
+        let set = unsafe { &mut *self.owned_tasks.get() };
+        let tasks = mem::replace(&mut *self.completed_tasks.lock().unwrap(), Vec::new());
+
+        for task in tasks {
+            let raw = &*task as *const Task;
+            assert!(set.remove(&raw));
+            unsafe {
+                drop(Arc::from_raw(raw));
+            }
         }
     }
 
