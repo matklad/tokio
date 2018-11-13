@@ -41,7 +41,7 @@ pub(crate) struct WorkerEntry {
     park: UnsafeCell<Option<BoxPark>>,
 
     // Thread unparker
-    unpark: BoxUnpark,
+    unpark: UnsafeCell<Option<BoxUnpark>>,
 
     // MPSC queue of jobs submitted to the worker from an external source.
     pub inbound: Queue,
@@ -58,7 +58,7 @@ impl WorkerEntry {
             worker: w,
             stealer: s,
             park: UnsafeCell::new(Some(park)),
-            unpark,
+            unpark: UnsafeCell::new(Some(unpark)),
             inbound: Queue::new(),
         }
     }
@@ -243,7 +243,9 @@ impl WorkerEntry {
     /// Unparks the worker thread.
     #[inline]
     pub fn unpark(&self) {
-        self.unpark.unpark();
+        if let Some(park) = unsafe { (*self.unpark.get()).as_ref() } {
+            park.unpark();
+        }
     }
 
     /// Registers a task in this worker.
@@ -280,6 +282,7 @@ impl WorkerEntry {
 
         unsafe {
             *self.park.get() = None;
+            *self.unpark.get() = None;
         }
     }
 
