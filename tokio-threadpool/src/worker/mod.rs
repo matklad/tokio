@@ -90,7 +90,12 @@ pub struct WorkerId(pub(crate) usize);
 thread_local!(static CURRENT_WORKER: Cell<*const Worker> = Cell::new(0 as *const _));
 
 impl Worker {
-    pub(crate) fn new(id: WorkerId, backup_id: BackupId, pool: Arc<Pool>, trigger: Arc<ShutdownTrigger>) -> Worker {
+    pub(crate) fn new(
+        id: WorkerId,
+        backup_id: BackupId,
+        pool: Arc<Pool>,
+        trigger: Arc<ShutdownTrigger>,
+    ) -> Worker {
         Worker {
             pool,
             id,

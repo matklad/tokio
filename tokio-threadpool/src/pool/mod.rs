@@ -50,7 +50,7 @@ pub(crate) struct Pool {
     // A worker is a thread that is processing the work queue and polling
     // futures.
     //
-    // The number of workers will *usually* be a small.
+    // The number of workers will *usually* be small.
     pub workers: Arc<[worker::Entry]>,
 
     // Completes the shutdown process when the `ThreadPool` and all `Worker`s get dropped.
