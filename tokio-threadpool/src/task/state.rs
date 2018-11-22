@@ -42,7 +42,7 @@ impl From<usize> for State {
 
         debug_assert!(
             src >= Idle as usize &&
-            src <= Complete as usize, "actual={}", src);
+            src <= Aborted as usize, "actual={}", src);
 
         unsafe { ::std::mem::transmute(src) }
     }
