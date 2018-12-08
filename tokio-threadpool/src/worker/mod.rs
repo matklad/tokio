@@ -460,9 +460,7 @@ impl Worker {
 
         // If this is the first time this task is being polled, initialize its home worker and
         // register it.
-        if task.init_home_worker(&self.id) {
-            self.entry().register_task(task.clone());
-        }
+        self.pool.registry.before_poll(&self.id, &task);
 
         let run = self.run_task2(&task, notify);
 
@@ -510,15 +508,11 @@ impl Worker {
                             }
                         }
 
-                        // Unregister the task from its home worker. If the
-                        // task is owned by the current worker, use the
-                        // `unregister_task` fast path. Otherwise, fall back to
-                        // the slower `completed_task` method.
-                        let home_index = task.home_worker().unwrap().0;
-                        if !self.is_blocking.get() && home_index == self.id().0 {
-                            self.entry().unregister_task(task);
+                        if self.is_blocking.get() {
+                            let id = WorkerId::new(self.pool.workers.len());
+                            self.pool.registry.task_completed(&id, task);
                         } else {
-                            self.pool.workers[home_index].completed_task(task);
+                            self.pool.registry.task_completed(&self.id, task);
                         }
 
                         // The worker's run loop will detect the shutdown state

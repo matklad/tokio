@@ -1,10 +1,12 @@
 mod blocking;
 mod blocking_state;
 mod queue;
+mod registry;
 mod state;
 
 pub(crate) use self::blocking::{Blocking, CanBlock};
 pub(crate) use self::queue::{Queue, Poll};
+pub(crate) use self::registry::Registry;
 use self::blocking_state::BlockingState;
 use self::state::State;
 
@@ -16,13 +18,10 @@ use futures::{self, Future, Async};
 use futures::executor::{self, Spawn};
 
 use std::{fmt, panic, ptr};
-use std::cell::{UnsafeCell};
+use std::cell::{Cell, UnsafeCell};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicPtr};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Release, Relaxed};
-
-/// The integer representation for `None::<WorkerId>`.
-const NONE_WORKER_ID: usize = !0;
 
 /// Harness around a future.
 ///
@@ -32,11 +31,6 @@ pub(crate) struct Task {
     /// Task lifecycle state
     state: AtomicUsize,
 
-    /// The ID of the worker entry this task is registered in.
-    ///
-    /// If this task hasn't been registered yet, the ID is set to `NONE_WORKER_ID`.
-    home_worker: AtomicUsize,
-
     /// Task blocking related state
     blocking: AtomicUsize,
 
@@ -45,6 +39,9 @@ pub(crate) struct Task {
 
     /// Next pointer in the queue of tasks pending blocking capacity.
     next_blocking: AtomicPtr<Task>,
+
+    /// TODO
+    pub registered_in: Cell<(usize, usize)>,
 
     /// Store the future at the head of the struct
     ///
@@ -71,10 +68,10 @@ impl Task {
 
         Task {
             state: AtomicUsize::new(State::new().into()),
-            home_worker: AtomicUsize::new(NONE_WORKER_ID),
             blocking: AtomicUsize::new(BlockingState::new().into()),
             next: AtomicPtr::new(ptr::null_mut()),
             next_blocking: AtomicPtr::new(ptr::null_mut()),
+            registered_in: Cell::new((!0, !0)),
             future: UnsafeCell::new(Some(task_fut)),
         }
     }
@@ -87,33 +84,11 @@ impl Task {
 
         Task {
             state: AtomicUsize::new(State::stub().into()),
-            home_worker: AtomicUsize::new(NONE_WORKER_ID),
             blocking: AtomicUsize::new(BlockingState::new().into()),
             next: AtomicPtr::new(ptr::null_mut()),
             next_blocking: AtomicPtr::new(ptr::null_mut()),
+            registered_in: Cell::new((!0, !0)),
             future: UnsafeCell::new(Some(task_fut)),
-        }
-    }
-
-    /// Try initializing this task's home worker.
-    ///
-    /// Returns `true` on success, or `false` if the home worker was already initialized.
-    pub fn init_home_worker(&self, id: &WorkerId) -> bool {
-        if self.home_worker.load(Relaxed) == NONE_WORKER_ID {
-            assert_eq!(self.home_worker.swap(id.0, Release), NONE_WORKER_ID);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Returns the ID of this task's home worker.
-    pub fn home_worker(&self) -> Option<WorkerId> {
-        let current = self.home_worker.load(Acquire);
-        if current == NONE_WORKER_ID {
-            None
-        } else {
-            Some(WorkerId(current))
         }
     }
 

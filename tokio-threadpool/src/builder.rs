@@ -3,6 +3,7 @@ use config::{Config, MAX_WORKERS};
 use park::{BoxPark, BoxedPark, DefaultPark};
 use shutdown::ShutdownTrigger;
 use pool::{Pool, MAX_BACKUP};
+use task::Registry;
 use thread_pool::ThreadPool;
 use worker::{self, Worker, WorkerId};
 
@@ -413,15 +414,18 @@ impl Builder {
             workers.into()
         };
 
+        let registry = Arc::new(Registry::new(self.pool_size));
+
         // Create a trigger that will clean up resources on shutdown.
         //
         // The `Pool` contains a weak reference to it, while `Worker`s and the `ThreadPool` contain
         // strong references.
-        let trigger = Arc::new(ShutdownTrigger::new(workers.clone()));
+        let trigger = Arc::new(ShutdownTrigger::new(workers.clone(), registry.clone()));
 
         // Create the pool
         let pool = Arc::new(Pool::new(
             workers,
+            registry,
             Arc::downgrade(&trigger),
             self.max_blocking,
             self.config.clone(),

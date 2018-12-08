@@ -15,7 +15,7 @@ use self::backup_stack::BackupStack;
 
 use config::Config;
 use shutdown::ShutdownTrigger;
-use task::{Task, Blocking};
+use task::{Task, Blocking, Registry};
 use worker::{self, Worker, WorkerId};
 
 use futures::Poll;
@@ -53,6 +53,8 @@ pub(crate) struct Pool {
     // The number of workers will *usually* be small.
     pub workers: Arc<[worker::Entry]>,
 
+    pub registry: Arc<Registry>,
+
     // Completes the shutdown process when the `ThreadPool` and all `Worker`s get dropped.
     //
     // When spawning a new `Worker`, this weak reference is upgraded and handed out to the new
@@ -81,6 +83,7 @@ impl Pool {
     /// Create a new `Pool`
     pub fn new(
         workers: Arc<[worker::Entry]>,
+        registry: Arc<Registry>,
         trigger: Weak<ShutdownTrigger>,
         max_blocking: usize,
         config: Config,
@@ -110,6 +113,7 @@ impl Pool {
             state: CachePadded::new(AtomicUsize::new(State::new().into())),
             sleep_stack: CachePadded::new(worker::Stack::new()),
             workers,
+            registry,
             trigger,
             backup,
             backup_stack,
