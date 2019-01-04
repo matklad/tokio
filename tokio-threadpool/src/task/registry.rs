@@ -12,7 +12,7 @@ use crossbeam_utils::CachePadded;
 // with `cleanup_completed_tasks()`.
 const TASK_CLEANUP_INTERVAL: usize = 100;
 
-struct Local {
+struct Shard {
     // Set of tasks registered in this worker entry.
     owned_tasks: Vec<*const Task>,
 
@@ -23,9 +23,9 @@ struct Local {
     ticker: Cell<usize>,
 }
 
-impl Local {
-    fn new() -> Local { // TODO: rename to Shard?
-        Local {
+impl Shard {
+    fn new() -> Shard {
+        Shard {
             owned_tasks: Vec::new(),
             completed_tasks: Mutex::new(Vec::new()),
             ticker: Cell::new(0),
@@ -91,30 +91,30 @@ impl Local {
 }
 
 pub struct Registry {
-    locals: Vec<CachePadded<UnsafeCell<Local>>>,
+    shards: Vec<CachePadded<UnsafeCell<Shard>>>,
 }
 
 impl Registry {
     pub fn new(num_workers: usize) -> Registry {
-        let locals = (0..num_workers)
+        let shards = (0..num_workers)
             .map(|_| {
-                CachePadded::new(UnsafeCell::new(Local::new()))
+                CachePadded::new(UnsafeCell::new(Shard::new()))
             })
             .collect();
 
-        Registry { locals }
+        Registry { shards }
     }
 
     /// Registers a task in this worker.
     ///
     /// This is called the first time a task is polled and assigned a home worker.
     pub(crate) fn before_poll(&self, worker_id: &WorkerId, task: &Arc<Task>) {
-        let (id, index) = task.registered_in.get();
+        let (id, _index) = task.registered_in.get();
 
         if id == !0 {
-            let local = self.locals[worker_id.0].get();
-            let local = unsafe { &mut *local };
-            local.register(worker_id, task);
+            let shard = self.shards[worker_id.0].get();
+            let shard = unsafe { &mut *shard };
+            shard.register(worker_id, task);
         }
     }
 
@@ -125,20 +125,20 @@ impl Registry {
         let (id, index) = task.registered_in.get();
         assert_ne!(index, !0);
 
-        let local = self.locals[id].get();
-        let local = unsafe { &mut *local };
+        let shard = self.shards[id].get();
+        let shard = unsafe { &mut *shard };
         if worker_id.0 == id {
-            local.unregister(worker_id, &task);
+            shard.unregister(worker_id, &task);
         } else {
-            local.completed_tasks.lock().unwrap().push(task);
+            shard.completed_tasks.lock().unwrap().push(task);
         }
     }
 
     pub fn abort_tasks(&self) {
-        for (i, local) in self.locals.iter().enumerate() {
-            let local = unsafe { &mut *local.get() };
+        for (i, shard) in self.shards.iter().enumerate() {
+            let shard = unsafe { &mut *shard.get() };
             let worker_id = WorkerId(i);
-            local.abort_tasks(&worker_id);
+            shard.abort_tasks(&worker_id);
         }
     }
 }
