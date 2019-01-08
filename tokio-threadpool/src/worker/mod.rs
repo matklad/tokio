@@ -242,10 +242,6 @@ impl Worker {
         while self.check_run_state(first) {
             first = false;
 
-            // Poll inbound until empty, transferring all tasks to the internal
-            // queue.
-            let consistent = self.drain_inbound();
-
             // Run the next available task
             if self.try_run_task(&notify) {
                 if self.is_blocking.get() {
@@ -253,6 +249,8 @@ impl Worker {
                     return;
                 }
 
+                // Poll the reactor and the global queue every now and then to
+                // ensure no task gets left behind.
                 if tick % LIGHT_SLEEP_INTERVAL == 0 {
                     self.sleep_light();
                 }
@@ -261,11 +259,6 @@ impl Worker {
                 spin_cnt = 0;
 
                 // As long as there is work, keep looping.
-                continue;
-            }
-
-            if !consistent {
-                spin_cnt = 0;
                 continue;
             }
 
@@ -423,7 +416,7 @@ impl Worker {
             if idx < len {
                 match self.pool.workers[idx].steal_tasks(self.entry()) {
                     Steal::Data(task) => {
-                        trace!("stole task");
+                        trace!("stole task from another worker");
 
                         self.run_task(task, notify);
 
@@ -542,7 +535,6 @@ impl Worker {
     {
         struct Guard<'a> {
             worker: &'a Worker,
-            allocated_at_run: bool
         }
 
         impl<'a> Drop for Guard<'a> {
@@ -553,69 +545,30 @@ impl Worker {
                 // This capacity is "use it or lose it", so if the thread is not
                 // transitioned to blocking in this call, then another task has
                 // to be notified.
-                if self.allocated_at_run && !self.worker.is_blocking.get() {
-                    self.worker.pool.notify_blocking_task(&self.worker.pool);
+                //
+                // If the task has consumed its blocking allocation but hasn't
+                // used it, it must be given to some other task instead.
+                if !self.worker.is_blocking.get() {
+                    let can_block = self.worker.current_task.can_block();
+                    if can_block == CanBlock::Allocated {
+                        self.worker.pool.notify_blocking_task(&self.worker.pool);
+                    }
                 }
 
                 self.worker.current_task.clear();
             }
         }
 
-        let can_block = task.consume_blocking_allocation();
-
         // Set `current_task`
-        self.current_task.set(task, can_block);
+        self.current_task.set(task, CanBlock::CanRequest);
 
         // Create the guard, this ensures that `current_task` is unset when the
         // function returns, even if the return is caused by a panic.
         let _g = Guard {
             worker: self,
-            allocated_at_run: can_block == CanBlock::Allocated
         };
 
         task.run(notify)
-    }
-
-    /// Drains all tasks on the extern queue and pushes them onto the internal
-    /// queue.
-    ///
-    /// Returns `true` if the operation was able to complete in a consistent
-    /// state.
-    #[inline]
-    fn drain_inbound(&self) -> bool {
-        use task::Poll::*;
-
-        let mut found_work = false;
-
-        loop {
-            let task = unsafe { self.entry().inbound.poll() };
-
-            match task {
-                Empty => {
-                    if found_work {
-                        // TODO: Why is this called on every iteration? Would it
-                        // not be better to only signal when work was found
-                        // after waking up?
-                        trace!("found work while draining; signal_work");
-                        self.pool.signal_work(&self.pool);
-                    }
-
-                    return true;
-                }
-                Inconsistent => {
-                    if found_work {
-                        trace!("found work while draining; signal_work");
-                        self.pool.signal_work(&self.pool);
-                    }
-
-                    return false;
-                }
-                Data(task) => {
-                    found_work = true;
-                    self.entry().push_internal(task);
-                }
-            }
-        }
     }
 
     /// Put the worker to sleep
@@ -693,14 +646,16 @@ impl Worker {
 
         trace!("    -> starting to sleep; idx={}", self.id.0);
 
+        // Do a quick check to see if there are any notifications in the
+        // reactor or new tasks in the global queue. Since this call will
+        // clear the wakeup token, we need to check the state again and
+        // only after that go to sleep.
+        self.sleep_light();
+
         // The state has been transitioned to sleeping, we can now wait by
         // calling the parker. This is done in a loop as condvars can wakeup
         // spuriously.
         loop {
-            self.entry().park();
-
-            trace!("    -> wakeup; idx={}", self.id.0);
-
             // Reload the state
             state = self.entry().state.load(Acquire).into();
 
@@ -732,14 +687,30 @@ impl Worker {
                     unreachable!();
                 }
             }
+
+            self.entry().park();
+
+            trace!("    -> wakeup; idx={}", self.id.0);
         }
     }
 
     /// This doesn't actually put the thread to sleep. It calls
     /// `park.park_timeout` with a duration of 0. This allows the park
     /// implementation to perform any work that might be done on an interval.
+    ///
+    /// Returns `true` if this worker has tasks in its queue.
     fn sleep_light(&self) {
+        const STEAL_COUNT: usize = 32;
+
         self.entry().park_timeout(Duration::from_millis(0));
+
+        for _ in 0..STEAL_COUNT {
+            if let Some(task) = self.pool.queue.pop() {
+                self.pool.submit(task, &self.pool);
+            } else {
+                break;
+            }
+        }
     }
 
     fn entry(&self) -> &Entry {
@@ -753,14 +724,8 @@ impl Drop for Worker {
         trace!("shutting down thread; idx={}", self.id.0);
 
         if self.should_finalize.get() {
-            // Get all inbound work and push it onto the work queue. The work
-            // queue is drained in the next step.
-            self.drain_inbound();
-
             // Drain the work queue
             self.entry().drain_tasks();
-
-            // TODO: Drain the work queue...
         }
     }
 }
@@ -782,7 +747,16 @@ impl CurrentTask {
     }
 
     fn can_block(&self) -> CanBlock {
-        self.can_block.get()
+        use self::CanBlock::*;
+
+        match self.can_block.get() {
+            Allocated => Allocated,
+            CanRequest | NoCapacity => {
+                let can_block = self.get_ref().consume_blocking_allocation();
+                self.can_block.set(can_block);
+                can_block
+            }
+        }
     }
 
     fn set_can_block(&self, can_block: CanBlock) {

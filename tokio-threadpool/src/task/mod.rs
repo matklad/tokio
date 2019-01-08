@@ -5,20 +5,19 @@ mod registry;
 mod state;
 
 pub(crate) use self::blocking::{Blocking, CanBlock};
-pub(crate) use self::queue::{Queue, Poll};
+pub(crate) use self::queue::Queue;
 pub(crate) use self::registry::Registry;
 use self::blocking_state::BlockingState;
 use self::state::State;
 
 use notifier::Notifier;
 use pool::Pool;
-use worker::WorkerId;
 
 use futures::{self, Future, Async};
 use futures::executor::{self, Spawn};
 
 use std::{fmt, panic, ptr};
-use std::cell::{Cell, UnsafeCell};
+use std::cell::{UnsafeCell};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicPtr};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Release, Relaxed};
@@ -33,9 +32,6 @@ pub(crate) struct Task {
 
     /// Task blocking related state
     blocking: AtomicUsize,
-
-    /// Next pointer in the queue that submits tasks to a worker.
-    next: AtomicPtr<Task>,
 
     /// Next pointer in the queue of tasks pending blocking capacity.
     next_blocking: AtomicPtr<Task>,
@@ -69,7 +65,6 @@ impl Task {
         Task {
             state: AtomicUsize::new(State::new().into()),
             blocking: AtomicUsize::new(BlockingState::new().into()),
-            next: AtomicPtr::new(ptr::null_mut()),
             next_blocking: AtomicPtr::new(ptr::null_mut()),
             reg_worker: AtomicUsize::new(!0),
             reg_index: AtomicUsize::new(!0),
@@ -86,7 +81,6 @@ impl Task {
         Task {
             state: AtomicUsize::new(State::stub().into()),
             blocking: AtomicUsize::new(BlockingState::new().into()),
-            next: AtomicPtr::new(ptr::null_mut()),
             next_blocking: AtomicPtr::new(ptr::null_mut()),
             reg_worker: AtomicUsize::new(!0),
             reg_index: AtomicUsize::new(!0),
@@ -282,7 +276,6 @@ impl Task {
 impl fmt::Debug for Task {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.debug_struct("Task")
-            .field("next", &self.next)
             .field("state", &self.state)
             .field("future", &"Spawn<BoxFuture>")
             .finish()
