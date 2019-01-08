@@ -1,14 +1,15 @@
 use park::{BoxPark, BoxUnpark};
-use task::{Task, Queue};
+use task::{Task, Queue, Registry};
 use worker::state::{State, PUSHED_MASK};
 
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::atomic::Ordering::{Acquire, AcqRel, Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering::{Acquire, AcqRel, Relaxed, Release};
 use std::time::Duration;
 
+use crossbeam::queue::SegQueue;
 use crossbeam_utils::CachePadded;
 use deque;
 
@@ -38,6 +39,12 @@ pub(crate) struct WorkerEntry {
     // Thread unparker
     unpark: UnsafeCell<Option<BoxUnpark>>,
 
+    registry: UnsafeCell<Option<Registry>>,
+
+    completed_tasks: SegQueue<Arc<Task>>,
+
+    needs_drain: AtomicBool,
+
     // MPSC queue of jobs submitted to the worker from an external source.
     pub inbound: Queue,
 }
@@ -53,6 +60,9 @@ impl WorkerEntry {
             stealer: s,
             park: UnsafeCell::new(Some(park)),
             unpark: UnsafeCell::new(Some(unpark)),
+            registry: UnsafeCell::new(Some(Registry::new())),
+            completed_tasks: SegQueue::new(),
+            needs_drain: AtomicBool::new(false),
             inbound: Queue::new(),
         }
     }
@@ -242,13 +252,46 @@ impl WorkerEntry {
         }
     }
 
+    #[inline]
+    pub fn register_task(&self, task: &Arc<Task>) {
+        let registry = unsafe { (*self.registry.get()).as_mut().unwrap() };
+        registry.add(task);
+    }
+
+    #[inline]
+    pub fn unregister_task(&self, task: Arc<Task>) {
+        let registry = unsafe { (*self.registry.get()).as_mut().unwrap() };
+        registry.remove(&task);
+        self.drain_completed_tasks();
+    }
+
+    #[inline]
+    pub fn completed_task(&self, task: Arc<Task>) {
+        self.completed_tasks.push(task);
+        self.needs_drain.store(true, Release);
+    }
+
+    #[inline]
+    fn drain_completed_tasks(&self) {
+        if self.needs_drain.compare_and_swap(true, false, Acquire) {
+            let registry = unsafe { (*self.registry.get()).as_mut().unwrap() };
+
+            while let Some(task) = self.completed_tasks.try_pop() {
+                registry.remove(&task);
+            }
+        }
+    }
+
     /// Drop the remaining incomplete tasks and the parker associated with this worker.
     ///
     /// This is called by the shutdown trigger.
     pub fn shutdown(&self) {
+        self.drain_completed_tasks();
+
         unsafe {
             *self.park.get() = None;
             *self.unpark.get() = None;
+            *self.registry.get() = None;
         }
     }
 

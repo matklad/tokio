@@ -414,18 +414,15 @@ impl Builder {
             workers.into()
         };
 
-        let registry = Arc::new(Registry::new(self.pool_size));
-
         // Create a trigger that will clean up resources on shutdown.
         //
         // The `Pool` contains a weak reference to it, while `Worker`s and the `ThreadPool` contain
         // strong references.
-        let trigger = Arc::new(ShutdownTrigger::new(workers.clone(), registry.clone()));
+        let trigger = Arc::new(ShutdownTrigger::new(workers.clone()));
 
         // Create the pool
         let pool = Arc::new(Pool::new(
             workers,
-            registry,
             Arc::downgrade(&trigger),
             self.max_blocking,
             self.config.clone(),

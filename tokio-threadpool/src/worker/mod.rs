@@ -24,7 +24,7 @@ use futures::{Poll, Async};
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::atomic::Ordering::{AcqRel, Acquire};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -460,7 +460,10 @@ impl Worker {
 
         // If this is the first time this task is being polled, initialize its home worker and
         // register it.
-        self.pool.registry.before_poll(&self.id, &task);
+        if task.reg_worker.load(Acquire) == !0 {
+            task.reg_worker.store(self.id.0, Release);
+            self.entry().register_task(&task);
+        }
 
         let run = self.run_task2(&task, notify);
 
@@ -508,11 +511,13 @@ impl Worker {
                             }
                         }
 
-                        if self.is_blocking.get() {
-                            let id = WorkerId::new(self.pool.workers.len());
-                            self.pool.registry.task_completed(&id, task);
+                        let worker = task.reg_worker.load(Acquire);
+                        assert_ne!(worker, !0);
+
+                        if !self.is_blocking.get() && worker == self.id.0 {
+                            self.entry().unregister_task(task);
                         } else {
-                            self.pool.registry.task_completed(&self.id, task);
+                            self.pool.workers[worker].completed_task(task);
                         }
 
                         // The worker's run loop will detect the shutdown state
@@ -738,7 +743,7 @@ impl Worker {
     }
 
     fn entry(&self) -> &Entry {
-        debug_assert!(!self.is_blocking.get());
+        // debug_assert!(!self.is_blocking.get());
         &self.pool.workers[self.id.0]
     }
 }

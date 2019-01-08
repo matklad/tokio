@@ -62,21 +62,19 @@ impl Future for Shutdown {
 pub(crate) struct ShutdownTrigger {
     inner: Arc<Mutex<Inner>>,
     workers: Arc<[worker::Entry]>,
-    registry: Arc<Registry>,
 }
 
 unsafe impl Send for ShutdownTrigger {}
 unsafe impl Sync for ShutdownTrigger {}
 
 impl ShutdownTrigger {
-    pub(crate) fn new(workers: Arc<[worker::Entry]>, registry: Arc<Registry>) -> ShutdownTrigger {
+    pub(crate) fn new(workers: Arc<[worker::Entry]>) -> ShutdownTrigger {
         ShutdownTrigger {
             inner: Arc::new(Mutex::new(Inner {
                 task: AtomicTask::new(),
                 completed: false,
             })),
             workers,
-            registry,
         }
     }
 }
@@ -87,8 +85,6 @@ impl Drop for ShutdownTrigger {
         for worker in self.workers.iter() {
             worker.shutdown();
         }
-
-        self.registry.abort_tasks();
 
         // Notify the task interested in shutdown.
         let mut inner = self.inner.lock().unwrap();

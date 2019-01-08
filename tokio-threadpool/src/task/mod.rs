@@ -40,8 +40,8 @@ pub(crate) struct Task {
     /// Next pointer in the queue of tasks pending blocking capacity.
     next_blocking: AtomicPtr<Task>,
 
-    /// TODO
-    pub registered_in: Cell<(usize, usize)>,
+    pub reg_worker: AtomicUsize,
+    pub reg_index: AtomicUsize,
 
     /// Store the future at the head of the struct
     ///
@@ -71,7 +71,8 @@ impl Task {
             blocking: AtomicUsize::new(BlockingState::new().into()),
             next: AtomicPtr::new(ptr::null_mut()),
             next_blocking: AtomicPtr::new(ptr::null_mut()),
-            registered_in: Cell::new((!0, !0)),
+            reg_worker: AtomicUsize::new(!0),
+            reg_index: AtomicUsize::new(!0),
             future: UnsafeCell::new(Some(task_fut)),
         }
     }
@@ -87,7 +88,8 @@ impl Task {
             blocking: AtomicUsize::new(BlockingState::new().into()),
             next: AtomicPtr::new(ptr::null_mut()),
             next_blocking: AtomicPtr::new(ptr::null_mut()),
-            registered_in: Cell::new((!0, !0)),
+            reg_worker: AtomicUsize::new(!0),
+            reg_index: AtomicUsize::new(!0),
             future: UnsafeCell::new(Some(task_fut)),
         }
     }
