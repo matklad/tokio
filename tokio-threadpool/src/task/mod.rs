@@ -36,7 +36,10 @@ pub(crate) struct Task {
     /// Next pointer in the queue of tasks pending blocking capacity.
     next_blocking: AtomicPtr<Task>,
 
+    /// ID of the worker that polled this task first.
     pub reg_worker: AtomicUsize,
+
+    /// Position of this task in the `Vec` inside the `Registry` it was registerd in.
     pub reg_index: AtomicUsize,
 
     /// Store the future at the head of the struct

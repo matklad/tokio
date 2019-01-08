@@ -451,8 +451,8 @@ impl Worker {
     fn run_task(&self, task: Arc<Task>, notify: &Arc<Notifier>) {
         use task::Run::*;
 
-        // If this is the first time this task is being polled, initialize its home worker and
-        // register it.
+        // If this is the first time this task is being polled, register it so that we can keep
+        // track of tasks that are in progress.
         if task.reg_worker.load(Acquire) == !0 {
             task.reg_worker.store(self.id.0, Release);
             self.entry().register_task(&task);
@@ -504,9 +504,10 @@ impl Worker {
                             }
                         }
 
+                        // Find which worker polled this task first.
                         let worker = task.reg_worker.load(Acquire);
-                        assert_ne!(worker, !0);
 
+                        // Unregister the task from the registry in which it was registered.
                         if !self.is_blocking.get() && worker == self.id.0 {
                             self.entry().unregister_task(task);
                         } else {
@@ -714,7 +715,7 @@ impl Worker {
     }
 
     fn entry(&self) -> &Entry {
-        // debug_assert!(!self.is_blocking.get());
+        debug_assert!(!self.is_blocking.get());
         &self.pool.workers[self.id.0]
     }
 }
