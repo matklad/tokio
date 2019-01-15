@@ -9,9 +9,9 @@ use std::cell::UnsafeCell;
 use std::fmt::{self, Debug};
 use std::mem;
 use std::ptr;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::Ordering::{Relaxed, SeqCst, Acquire, Release, AcqRel};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize};
-use std::sync::{Arc, Weak};
 use std::usize;
 use std::thread;
 use std::marker::PhantomData;
@@ -20,11 +20,11 @@ use std::marker::PhantomData;
 ///
 /// This is used both by `FuturesUnordered` and the current-thread executor.
 pub struct Scheduler<U> {
-    inner: Arc<Inner<U>>,
+    inner: Rc<Inner<U>>,
     nodes: List<U>,
 }
 
-pub struct Notify<'a, U: 'a>(&'a Arc<Node<U>>);
+pub struct Notify<'a, U: 'a>(&'a Rc<Node<U>>);
 
 // A linked-list of nodes
 struct List<U> {
@@ -47,16 +47,16 @@ struct List<U> {
 // originated from `Scheduler` with `&mut self` The next call to `tick` will
 // (eventually) see this node and call `poll` on the item.
 //
-// Nodes are wrapped in `Arc` cells which manage the lifetime of the node.
-// However, `Arc` handles are sometimes cast to `*const Node` pointers.
+// Nodes are wrapped in `Rc` cells which manage the lifetime of the node.
+// However, `Rc` handles are sometimes cast to `*const Node` pointers.
 // Specifically, when a node is stored in at least one of the two lists
-// described above, this represents a logical `Arc` handle. This is how
+// described above, this represents a logical `Rc` handle. This is how
 // `Scheduler` maintains its reference to all nodes it manages. Each
-// `NotifyHandle` instance is an `Arc<Node>` as well.
+// `NotifyHandle` instance is an `Rc<Node>` as well.
 //
 // When `Scheduler` drops, it clears the linked list of all nodes that it
 // manages. When doing so, it must attempt to decrement the reference count (by
-// dropping an Arc handle). However, it can **only** decrement the reference
+// dropping an Rc handle). However, it can **only** decrement the reference
 // count if the node is not currently stored in the mpsc channel. If the node
 // **is** "queued" in the mpsc channel, then the arc reference count cannot be
 // decremented. Once the node is popped from the mpsc channel, then the final
@@ -74,7 +74,7 @@ struct Inner<U> {
     tail_readiness: UnsafeCell<*const Node<U>>,
 
     // Used as part of the mpsc queue algorithm
-    stub: Arc<Node<U>>,
+    stub: Rc<Node<U>>,
 }
 
 unsafe impl<U: Sync + Send> Send for Inner<U> {}
@@ -142,7 +142,7 @@ where U: Unpark,
     /// The returned `Scheduler` does not contain any items and, in this
     /// state, `Scheduler::poll` will return `Ok(Async::Ready(None))`.
     pub fn new(unpark: U) -> Self {
-        let stub = Arc::new(Node {
+        let stub = Rc::new(Node {
             item: UnsafeCell::new(None),
             notified_at: AtomicUsize::new(0),
             next_all: UnsafeCell::new(ptr::null()),
@@ -152,7 +152,7 @@ where U: Unpark,
             queue: Weak::new(),
         });
         let stub_ptr = &*stub as *const Node<U>;
-        let inner = Arc::new(Inner {
+        let inner = Rc::new(Inner {
             unpark,
             tick_num: AtomicUsize::new(0),
             head_readiness: AtomicPtr::new(stub_ptr as *mut _),
@@ -167,21 +167,21 @@ where U: Unpark,
     }
 
     pub fn notify(&self) -> NotifyHandle {
-        self.inner.clone().into()
+        rc_to_notify_handle(self.inner.clone())
     }
 
     pub fn schedule(&mut self, item: Box<Future<Item = (), Error = ()>>) {
         // Get the current scheduler tick
         let tick_num = self.inner.tick_num.load(SeqCst);
 
-        let node = Arc::new(Node {
+        let node = Rc::new(Node {
             item: UnsafeCell::new(Some(Task::new(item))),
             notified_at: AtomicUsize::new(tick_num),
             next_all: UnsafeCell::new(ptr::null_mut()),
             prev_all: UnsafeCell::new(ptr::null_mut()),
             next_readiness: AtomicPtr::new(ptr::null_mut()),
             queued: AtomicBool::new(true),
-            queue: Arc::downgrade(&self.inner),
+            queue: Rc::downgrade(&self.inner),
         });
 
         // Right now our node has a strong reference count of 1. We transfer
@@ -265,7 +265,7 @@ where U: Unpark,
                 struct Bomb<'a, U: Unpark + 'a> {
                     borrow: &'a mut Borrow<'a, U>,
                     enter: &'a mut Enter,
-                    node: Option<Arc<Node<U>>>,
+                    node: Option<Rc<Node<U>>>,
                 }
 
                 impl<'a, U: Unpark> Drop for Bomb<'a, U> {
@@ -312,7 +312,7 @@ where U: Unpark,
                     // Poll the underlying item with the appropriate `notify`
                     // implementation. This is where a large bit of the unsafety
                     // starts to stem from internally. The `notify` instance itself
-                    // is basically just our `Arc<Node>` and tracks the mpsc
+                    // is basically just our `Rc<Node>` and tracks the mpsc
                     // queue of ready items.
                     //
                     // Critically though `Node` won't actually access `Task`, the
@@ -374,7 +374,7 @@ impl fmt::Debug for Task {
     }
 }
 
-fn release_node<U>(node: Arc<Node<U>>) {
+fn release_node<U>(node: Rc<Node<U>>) {
     // The item is done, try to reset the queued flag. This will prevent
     // `notify` from doing any work in the item
     let prev = node.queued.swap(true, SeqCst);
@@ -560,7 +560,7 @@ impl<U> List<U> {
     }
 
     /// Prepends an element to the back of the list
-    fn push_back(&mut self, node: Arc<Node<U>>) -> *const Node<U> {
+    fn push_back(&mut self, node: Rc<Node<U>>) -> *const Node<U> {
         let ptr = arc2ptr(node);
 
         unsafe {
@@ -584,7 +584,7 @@ impl<U> List<U> {
     }
 
     /// Pop an element from the front of the list
-    fn pop_front(&mut self) -> Option<Arc<Node<U>>> {
+    fn pop_front(&mut self) -> Option<Rc<Node<U>>> {
         if self.head.is_null() {
             // The list is empty
             return None;
@@ -593,7 +593,7 @@ impl<U> List<U> {
         self.len -= 1;
 
         unsafe {
-            // Convert the ptr to Arc<_>
+            // Convert the ptr to Rc<_>
             let node = ptr2arc(self.head);
 
             // Update the head pointer
@@ -611,7 +611,7 @@ impl<U> List<U> {
     }
 
     /// Remove a specific node
-    unsafe fn remove(&mut self, node: *const Node<U>) -> Arc<Node<U>> {
+    unsafe fn remove(&mut self, node: *const Node<U>) -> Rc<Node<U>> {
         let node = ptr2arc(node);
         let next = *node.next_all.get();
         let prev = *node.prev_all.get();
@@ -652,51 +652,51 @@ impl<'a, U: Unpark> From<Notify<'a, U>> for NotifyHandle {
     fn from(handle: Notify<'a, U>) -> NotifyHandle {
         unsafe {
             let ptr = handle.0.clone();
-            let ptr = mem::transmute::<Arc<Node<U>>, *mut ArcNode<U>>(ptr);
+            let ptr = mem::transmute::<Rc<Node<U>>, *mut RcNode<U>>(ptr);
             NotifyHandle::new(hide_lt(ptr))
         }
     }
 }
 
-struct ArcNode<U>(PhantomData<U>);
+struct RcNode<U>(PhantomData<U>);
 
 // We should never touch `Task` on any thread other than the one owning
 // `Scheduler`, so this should be a safe operation.
-unsafe impl<U: Sync + Send> Send for ArcNode<U> {}
-unsafe impl<U: Sync + Send> Sync for ArcNode<U> {}
+unsafe impl<U: Sync + Send> Send for RcNode<U> {}
+unsafe impl<U: Sync + Send> Sync for RcNode<U> {}
 
-impl<U: Unpark> executor::Notify for ArcNode<U> {
+impl<U: Unpark> executor::Notify for RcNode<U> {
     fn notify(&self, _id: usize) {
         unsafe {
-            let me: *const ArcNode<U> = self;
-            let me: *const *const ArcNode<U> = &me;
-            let me = me as *const Arc<Node<U>>;
+            let me: *const RcNode<U> = self;
+            let me: *const *const RcNode<U> = &me;
+            let me = me as *const Rc<Node<U>>;
             Node::notify(&*me)
         }
     }
 }
 
-unsafe impl<U: Unpark> UnsafeNotify for ArcNode<U> {
+unsafe impl<U: Unpark> UnsafeNotify for RcNode<U> {
     unsafe fn clone_raw(&self) -> NotifyHandle {
-        let me: *const ArcNode<U> = self;
-        let me: *const *const ArcNode<U> = &me;
-        let me = &*(me as *const Arc<Node<U>>);
+        let me: *const RcNode<U> = self;
+        let me: *const *const RcNode<U> = &me;
+        let me = &*(me as *const Rc<Node<U>>);
         Notify(me).into()
     }
 
     unsafe fn drop_raw(&self) {
-        let mut me: *const ArcNode<U> = self;
-        let me = &mut me as *mut *const ArcNode<U> as *mut Arc<Node<U>>;
+        let mut me: *const RcNode<U> = self;
+        let me = &mut me as *mut *const RcNode<U> as *mut Rc<Node<U>>;
         ptr::drop_in_place(me);
     }
 }
 
-unsafe fn hide_lt<U: Unpark>(p: *mut ArcNode<U>) -> *mut UnsafeNotify {
+unsafe fn hide_lt<U: Unpark>(p: *mut RcNode<U>) -> *mut UnsafeNotify {
     mem::transmute(p as *mut UnsafeNotify)
 }
 
 impl<U: Unpark> Node<U> {
-    fn notify(me: &Arc<Node<U>>) {
+    fn notify(me: &Rc<Node<U>>) {
         let inner = match me.queue.upgrade() {
             Some(inner) => inner,
             None => return,
@@ -746,18 +746,18 @@ impl<U> Drop for Node<U> {
     }
 }
 
-fn arc2ptr<T>(ptr: Arc<T>) -> *const T {
+fn arc2ptr<T>(ptr: Rc<T>) -> *const T {
     let addr = &*ptr as *const T;
     mem::forget(ptr);
     return addr
 }
 
-unsafe fn ptr2arc<T>(ptr: *const T) -> Arc<T> {
-    let anchor = mem::transmute::<usize, Arc<T>>(0x10);
+unsafe fn ptr2arc<T>(ptr: *const T) -> Rc<T> {
+    let anchor = mem::transmute::<usize, Rc<T>>(0x10);
     let addr = &*anchor as *const T;
     mem::forget(anchor);
     let offset = addr as isize - 0x10;
-    mem::transmute::<isize, Arc<T>>(ptr as isize - offset)
+    mem::transmute::<isize, Rc<T>>(ptr as isize - offset)
 }
 
 fn abort(s: &str) -> ! {
@@ -771,4 +771,55 @@ fn abort(s: &str) -> ! {
 
     let _bomb = DoublePanic;
     panic!("{}", s);
+}
+
+struct RcWrapped<T>(PhantomData<T>);
+
+impl<T: executor::Notify + 'static> executor::Notify for RcWrapped<T> {
+    fn notify(&self, id: usize) {
+        unsafe {
+            let me: *const RcWrapped<T> = self;
+            T::notify(&*(&me as *const *const RcWrapped<T> as *const Rc<T>),
+                      id)
+        }
+    }
+
+    fn clone_id(&self, id: usize) -> usize {
+        unsafe {
+            let me: *const RcWrapped<T> = self;
+            T::clone_id(&*(&me as *const *const RcWrapped<T> as *const Rc<T>),
+                        id)
+        }
+    }
+
+    fn drop_id(&self, id: usize) {
+        unsafe {
+            let me: *const RcWrapped<T> = self;
+            T::drop_id(&*(&me as *const *const RcWrapped<T> as *const Rc<T>),
+                       id)
+        }
+    }
+}
+
+unsafe impl<T: executor::Notify + 'static> UnsafeNotify for RcWrapped<T> {
+    unsafe fn clone_raw(&self) -> NotifyHandle {
+        let me: *const RcWrapped<T> = self;
+        let rc = (*(&me as *const *const RcWrapped<T> as *const Rc<T>)).clone();
+        rc_to_notify_handle(rc)
+    }
+
+    unsafe fn drop_raw(&self) {
+        let mut me: *const RcWrapped<T> = self;
+        let me = &mut me as *mut *const RcWrapped<T> as *mut Rc<T>;
+        ptr::drop_in_place(me);
+    }
+}
+
+fn rc_to_notify_handle<T>(rc: Rc<T>) -> NotifyHandle
+    where T: executor::Notify + 'static,
+{
+    unsafe {
+        let ptr = mem::transmute::<Rc<T>, *mut RcWrapped<T>>(rc);
+        NotifyHandle::new(ptr)
+    }
 }
