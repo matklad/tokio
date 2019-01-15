@@ -21,3 +21,8 @@ categories = ["concurrency", "asynchronous"]
 [dependencies]
 tokio-executor = { version = "0.1.5", path = "../tokio-executor" }
 futures = "0.1.19"
+
+[dev-dependencies]
+mio = "0.6.14"
+tokio = { version = "0.1.14", path = ".." }
+tokio-reactor = { version = "0.1.8", path = "../tokio-reactor" }
