@@ -249,8 +249,16 @@ impl Pool {
 
                     trace!("    -> submit internal; idx={}", idx);
 
-                    worker.pool.workers[idx].submit_internal(task);
-                    worker.pool.signal_work(pool);
+                    // When the depth is zero, this task is submitted either from outside the
+                    // thread pool or from an external source like the reactor or timer.
+                    let depth = worker.depth.get();
+
+                    if depth > 0 && depth <= 1 {
+                        worker.run_task_inline(task);
+                    } else {
+                        worker.pool.workers[idx].submit_internal(task);
+                        worker.pool.signal_work(pool);
+                    }
                     return;
                 }
             }

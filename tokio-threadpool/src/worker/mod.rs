@@ -48,6 +48,8 @@ pub struct Worker {
     // Backup thread ID assigned to processing this worker.
     backup_id: BackupId,
 
+    notify: Arc<Notifier>,
+
     // Set to the task that is currently being polled by the worker. This is
     // needed so that `blocking` blocks are able to interact with this task.
     //
@@ -64,12 +66,14 @@ pub struct Worker {
     // Completes the shutdown process when the `ThreadPool` and all `Worker`s get dropped.
     trigger: Arc<ShutdownTrigger>,
 
+    pub depth: Cell<usize>,
+
     // Keep the value on the current thread.
     _p: PhantomData<Rc<()>>,
 }
 
 /// Tracks the state related to the currently running task.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CurrentTask {
     /// This has to be a raw pointer to make it compile, but great care is taken
     /// when this is set.
@@ -97,6 +101,9 @@ impl Worker {
         trigger: Arc<ShutdownTrigger>,
     ) -> Worker {
         Worker {
+            notify: Arc::new(Notifier {
+                pool: pool.clone(),
+            }),
             pool,
             id,
             backup_id,
@@ -104,6 +111,7 @@ impl Worker {
             is_blocking: Cell::new(false),
             should_finalize: Cell::new(false),
             trigger,
+            depth: Cell::new(0),
             _p: PhantomData,
         }
     }
@@ -445,6 +453,10 @@ impl Worker {
         found_work
     }
 
+    pub(crate) fn run_task_inline(&self, task: Arc<Task>) {
+        self.run_task(task, &self.notify);
+    }
+
     fn run_task(&self, task: Arc<Task>, notify: &Arc<Notifier>) {
         use task::Run::*;
 
@@ -455,7 +467,9 @@ impl Worker {
             self.entry().register_task(&task);
         }
 
+        self.depth.set(self.depth.get() + 1);
         let run = self.run_task2(&task, notify);
+        self.depth.set(self.depth.get() - 1);
 
         // TODO: Try to claim back the worker state in case the backup thread
         // did not start up fast enough. This is a performance optimization.
@@ -533,6 +547,7 @@ impl Worker {
     {
         struct Guard<'a> {
             worker: &'a Worker,
+            previous_task: CurrentTask,
         }
 
         impl<'a> Drop for Guard<'a> {
@@ -553,17 +568,19 @@ impl Worker {
                     }
                 }
 
-                self.worker.current_task.clear();
+                self.worker.current_task.store(&self.previous_task);
             }
         }
 
         // Set `current_task`
+        let previous_task = self.current_task.clone();
         self.current_task.set(task, CanBlock::CanRequest);
 
         // Create the guard, this ensures that `current_task` is unset when the
         // function returns, even if the return is caused by a panic.
         let _g = Guard {
             worker: self,
+            previous_task,
         };
 
         task.run(notify)
@@ -766,6 +783,11 @@ impl CurrentTask {
     fn set(&self, task: &Arc<Task>, can_block: CanBlock) {
         self.task.set(Some(task as *const _));
         self.can_block.set(can_block);
+    }
+
+    fn store(&self, other: &Self) {
+        self.task.set(other.task.get());
+        self.can_block.set(other.can_block.get());
     }
 
     /// Reset the `CurrentTask` to null state.
