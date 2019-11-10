@@ -118,6 +118,7 @@ default-features = false
 optional = true
 
 [dev-dependencies]
+async-std = { git = "https://github.com/async-rs/async-std.git" }
 tokio-test = { version = "=0.2.0-alpha.6", path = "../tokio-test" }
 futures-preview = { version = "=0.3.0-alpha.19", features = ["async-await"] }
 loom = { version = "0.2.12", features = ["futures", "checkpoint"] }
